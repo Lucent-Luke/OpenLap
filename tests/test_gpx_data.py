@@ -173,6 +173,80 @@ def test_load_gpx_no_timestamps_1hz_spacing(tmp_path):
     assert elapsed == pytest.approx([0.0, 1.0, 2.0, 3.0, 4.0])
 
 
+# ── Sensor channels (heart rate, cadence, power) ──────────────────────────────
+
+def _write_gpx_sensors(tmp_path, point_exts, ns=''):
+    """One track point per entry in *point_exts* (the inner XML of its
+    <extensions>, or None for no extensions), 1 s apart."""
+    pts = ''
+    for i, ext in enumerate(point_exts):
+        ext_xml = f'<extensions>{ext}</extensions>' if ext is not None else ''
+        pts += (f'<trkpt lat="50.{i:04d}" lon="4.{i:04d}">'
+                f'<time>2024-06-15T13:00:{i:02d}Z</time>{ext_xml}</trkpt>')
+    content = (
+        '<?xml version="1.0"?>'
+        f'<gpx version="1.1" xmlns="http://www.topografix.com/GPX/1/1" {ns}>'
+        f'<trk><trkseg>{pts}</trkseg></trk></gpx>'
+    )
+    p = tmp_path / "ride.gpx"
+    p.write_text(content)
+    return str(p)
+
+
+_GARMIN_NS = ('xmlns:gpxtpx="http://www.garmin.com/xmlschemas/TrackPointExtension/v1" '
+              'xmlns:pwr="http://www.garmin.com/xmlschemas/PowerExtension/v1"')
+
+
+def test_load_gpx_garmin_sensor_channels(tmp_path):
+    exts = [
+        f'<pwr:PowerInWatts>{200 + i}</pwr:PowerInWatts>'
+        f'<gpxtpx:TrackPointExtension><gpxtpx:hr>{140 + i}</gpxtpx:hr>'
+        f'<gpxtpx:cad>{85 + i}</gpxtpx:cad></gpxtpx:TrackPointExtension>'
+        for i in range(4)
+    ]
+    session = load_gpx(_write_gpx_sensors(tmp_path, exts, _GARMIN_NS))
+    assert session.extra_channel_meta == {
+        'Heart Rate': {'label': 'Heart Rate', 'unit': 'bpm'},
+        'Cadence':    {'label': 'Cadence',    'unit': 'rpm'},
+        'Power':      {'label': 'Power',      'unit': 'W'},
+    }
+    assert [p.extra['Heart Rate'] for p in session.all_points] == [140, 141, 142, 143]
+    assert [p.extra['Cadence'] for p in session.all_points] == [85, 86, 87, 88]
+    assert [p.extra['Power'] for p in session.all_points] == [200, 201, 202, 203]
+
+
+def test_load_gpx_strava_power(tmp_path):
+    # Strava writes power as a bare, un-namespaced <power> in <extensions>
+    exts = [f'<power>{250 + 10 * i}</power>' for i in range(3)]
+    session = load_gpx(_write_gpx_sensors(tmp_path, exts))
+    assert list(session.extra_channel_meta) == ['Power']
+    assert [p.extra['Power'] for p in session.all_points] == [250, 260, 270]
+
+
+def test_load_gpx_sensor_gap_interpolated(tmp_path):
+    exts = ['<hr>100</hr>', None, '<hr>120</hr>', '<hr>not a number</hr>', '<hr>140</hr>']
+    session = load_gpx(_write_gpx_sensors(tmp_path, exts))
+    assert [p.extra['Heart Rate'] for p in session.all_points] == pytest.approx(
+        [100, 110, 120, 130, 140])
+
+
+def test_load_gpx_without_sensors_has_no_extra_channels():
+    session = load_gpx(GPX_PATH)
+    assert session.extra_channel_meta == {}
+    assert all(p.extra == {} for p in session.all_points)
+
+
+def test_load_gpx_sensor_channels_discoverable_and_interpolated(tmp_path):
+    from channel_discovery import list_channels
+    exts = [f'<hr>{100 + 10 * i}</hr><power>{200 + 20 * i}</power>' for i in range(10)]
+    session = load_gpx(_write_gpx_sensors(tmp_path, exts))
+    keys = {c['key'] for c in list_channels(session)}
+    assert {'Heart Rate', 'Power'} <= keys
+    mid = session.interpolate_at(0.5)
+    assert mid.extra['Heart Rate'] == pytest.approx(105)
+    assert mid.extra['Power'] == pytest.approx(210)
+
+
 # ── Error cases ────────────────────────────────────────────────────────────────
 
 def test_load_gpx_empty_trkseg_raises(tmp_path):

@@ -8,6 +8,10 @@ Speed is read from Garmin TrackPointExtension (<gpxtpx:speed> in m/s)
 when present; otherwise derived from consecutive GPS coordinates via
 the Haversine formula.
 
+Heart rate, cadence and power from track point extensions (Garmin
+TrackPointExtension, Garmin PowerExtension, Strava's bare <power>) are
+kept as extra channels; see _SENSOR_TAGS.
+
 Longitudinal G  = Δspeed / Δtime / 9.81
 Lateral G       = speed * heading_rate / 9.81   (centripetal approximation)
 
@@ -43,6 +47,17 @@ _GPX_NS = {
     'gpxtpx': 'http://www.garmin.com/xmlschemas/TrackPointExtension/v1',
     'gpxtpx2': 'http://www.garmin.com/xmlschemas/TrackPointExtensionv2/xsd',
 }
+
+# Sensor channels read from <extensions>, matched on the lower-cased local tag
+# name so any namespace prefix works: Garmin TrackPointExtension (hr, cad),
+# Garmin PowerExtension (PowerInWatts), Strava/Wahoo (power), ClueTrust
+# gpxdata (hr, cadence). Channel name -> (unit, tag names).
+_SENSOR_TAGS = {
+    'Heart Rate': ('bpm', ('hr', 'heartrate')),
+    'Cadence':    ('rpm', ('cad', 'cadence')),
+    'Power':      ('W',   ('power', 'powerinwatts', 'watts')),
+}
+_SENSOR_BY_TAG = {tag: name for name, (_, tags) in _SENSOR_TAGS.items() for tag in tags}
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -209,17 +224,25 @@ def load_gpx(path: str) -> Session:
                     except ValueError:
                         pass
 
-                # Try to read speed from Garmin extensions (m/s)
+                # Speed (m/s) and sensor channels from the point's extensions
                 ext_speed: Optional[float] = None
+                sensors: dict = {}
                 ext_el = _find_local(pt, 'extensions')
                 if ext_el is not None:
                     for child in ext_el.iter():
-                        if _local(child) == 'speed':
-                            try:
-                                ext_speed = float(child.text or '')
-                            except (ValueError, TypeError):
-                                pass
-                            break
+                        tag = _local(child)
+                        name = _SENSOR_BY_TAG.get(tag.lower())
+                        if tag != 'speed' and name is None:
+                            continue
+                        try:
+                            value = float(child.text or '')
+                        except (ValueError, TypeError):
+                            continue
+                        if tag == 'speed':
+                            if ext_speed is None:
+                                ext_speed = value
+                        else:
+                            sensors.setdefault(name, value)
 
                 raw.append({
                     'lat':       lat,
@@ -227,6 +250,7 @@ def load_gpx(path: str) -> Session:
                     'alt':       alt,
                     'time':      ts,
                     'ext_speed': ext_speed,   # m/s or None
+                    'sensors':   sensors,     # channel name -> value
                 })
 
     if not raw:
@@ -292,6 +316,22 @@ def load_gpx(path: str) -> Session:
     speed_kmh = np.clip(speed_kmh, 0.0, 1000.0)
     speed_kmh, lon_g, lat_g = track_dynamics(elapsed, lats, lons, speed_kmh, _SMOOTH_SIGMA)
 
+    # ── Sensor channels (heart rate, cadence, power) ───────────────────────────
+    # Only channels the file actually logged. Points missing a value (sensor
+    # dropout, or a device writing it less often than GPS) are interpolated
+    # over elapsed time. Not smoothed: these are measured, not derived.
+    sensor_values: dict = {}
+    for name in _SENSOR_TAGS:
+        vals = np.array([r['sensors'].get(name, float('nan')) for r in timed])
+        have = ~np.isnan(vals)
+        if not have.any():
+            continue
+        if not have.all():
+            vals[~have] = np.interp(elapsed[~have], elapsed[have], vals[have])
+        sensor_values[name] = vals
+    extra_channel_meta = {name: {'label': name, 'unit': _SENSOR_TAGS[name][0]}
+                          for name in sensor_values}
+
     # ── Build DataPoints ───────────────────────────────────────────────────────
     all_pts: List[DataPoint] = []
     for i in range(n):
@@ -311,6 +351,7 @@ def load_gpx(path: str) -> Session:
             gyro_z      = 0.0,
             elapsed     = float(elapsed[i]),
             lap_elapsed = float(elapsed[i]),
+            extra       = {name: float(v[i]) for name, v in sensor_values.items()},
         )
         all_pts.append(pt)
 
@@ -354,4 +395,5 @@ def load_gpx(path: str) -> Session:
         is_bike       = False,
         csv_path      = path,
         source_speed_unit = 'kmh',
+        extra_channel_meta = extra_channel_meta,
     )
